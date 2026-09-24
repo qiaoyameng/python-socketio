@@ -9,6 +9,7 @@ import pytest
 
 from socketio import async_server
 from socketio import async_namespace
+from socketio import async_pubsub_manager
 from socketio import exceptions
 from socketio import namespace
 from socketio import packet
@@ -215,6 +216,139 @@ class TestAsyncServer:
         )
         with pytest.raises(RuntimeError):
             await s.call('foo', sid='123', timeout=12)
+
+    def _get_call_room_server(self, eio):
+        eio.return_value.send = mock.AsyncMock()
+        s = async_server.AsyncServer()
+        s.eio.create_event.side_effect = asyncio.Event
+        return s
+
+    async def _wait_for_callbacks(self, s, sids, ack_id=1):
+        for _ in range(100):
+            if all(ack_id in s.manager.callbacks.get(sid, {})
+                   for sid in sids):
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError('callbacks were not registered')
+
+    async def test_call_room(self, eio):
+        s = self._get_call_room_server(eio)
+        sid1 = await s.manager.connect('eio1', '/')
+        sid2 = await s.manager.connect('eio2', '/')
+        await s.enter_room(sid1, 'room')
+        await s.enter_room(sid2, 'room')
+        task = asyncio.create_task(s.call_room(
+            'foo', data={'a': 'b'}, room='room', timeout=5))
+        await self._wait_for_callbacks(s, [sid1, sid2])
+        # acknowledge out of order
+        await s.manager.trigger_callback(sid2, 1, ['bar'])
+        await s.manager.trigger_callback(sid1, 1, ['baz'])
+        result = await task
+        assert result == {'responses': {sid1: 'baz', sid2: 'bar'},
+                          'missing': []}
+        assert s.eio.send.await_count == 2
+
+    async def test_call_room_empty_room(self, eio):
+        s = self._get_call_room_server(eio)
+        result = await s.call_room('foo', room='empty', timeout=60)
+        assert result == {'responses': {}, 'missing': []}
+        s.eio.send.assert_not_called()
+
+    async def test_call_room_partial_timeout_and_late_ack(self, eio):
+        s = self._get_call_room_server(eio)
+        sid1 = await s.manager.connect('eio1', '/')
+        sid2 = await s.manager.connect('eio2', '/')
+        await s.enter_room(sid1, 'room')
+        await s.enter_room(sid2, 'room')
+        task = asyncio.create_task(s.call_room(
+            'foo', room='room', timeout=0.2))
+        await self._wait_for_callbacks(s, [sid1, sid2])
+        await s.manager.trigger_callback(sid1, 1, ['foo'])
+        result = await task
+        assert result == {'responses': {sid1: 'foo'}, 'missing': [sid2]}
+        # the callback of the client that did not respond is removed
+        assert 1 not in s.manager.callbacks[sid2]
+        # a late acknowledgement is ignored and does not fail
+        await s.manager.trigger_callback(sid2, 1, ['too late'])
+        # a second call is not affected by the previous one
+        task = asyncio.create_task(s.call_room(
+            'foo', room='room', timeout=5))
+        await self._wait_for_callbacks(s, [sid1, sid2], ack_id=2)
+        await s.manager.trigger_callback(sid2, 2, ['bar'])
+        await s.manager.trigger_callback(sid1, 2, ['baz'])
+        result = await task
+        assert result == {'responses': {sid1: 'baz', sid2: 'bar'},
+                          'missing': []}
+
+    async def test_call_room_disconnect(self, eio):
+        s = self._get_call_room_server(eio)
+        sid1 = await s.manager.connect('eio1', '/')
+        sid2 = await s.manager.connect('eio2', '/')
+        await s.enter_room(sid1, 'room')
+        await s.enter_room(sid2, 'room')
+        task = asyncio.create_task(s.call_room(
+            'foo', room='room', timeout=0.2))
+        await self._wait_for_callbacks(s, [sid1, sid2])
+        await s.manager.trigger_callback(sid1, 1, ['foo'])
+        await s.manager.disconnect(sid2, '/')
+        assert sid2 not in s.manager.callbacks
+        result = await task
+        assert result == {'responses': {sid1: 'foo'}, 'missing': [sid2]}
+
+    async def test_call_room_leave_room_still_acks(self, eio):
+        s = self._get_call_room_server(eio)
+        sid1 = await s.manager.connect('eio1', '/')
+        sid2 = await s.manager.connect('eio2', '/')
+        await s.enter_room(sid1, 'room')
+        await s.enter_room(sid2, 'room')
+        task = asyncio.create_task(s.call_room(
+            'foo', room='room', timeout=5))
+        await self._wait_for_callbacks(s, [sid1, sid2])
+        # a client that leaves the room can still acknowledge
+        await s.leave_room(sid2, 'room')
+        await s.manager.trigger_callback(sid2, 1, ['bar'])
+        await s.manager.trigger_callback(sid1, 1, ['baz'])
+        result = await task
+        assert result == {'responses': {sid1: 'baz', sid2: 'bar'},
+                          'missing': []}
+
+    async def test_call_room_join_after_send_not_included(self, eio):
+        s = self._get_call_room_server(eio)
+        sid1 = await s.manager.connect('eio1', '/')
+        await s.enter_room(sid1, 'room')
+        task = asyncio.create_task(s.call_room(
+            'foo', room='room', timeout=5))
+        await self._wait_for_callbacks(s, [sid1])
+        # a client that joins after the call is not a recipient
+        sid2 = await s.manager.connect('eio2', '/')
+        await s.enter_room(sid2, 'room')
+        await s.manager.trigger_callback(sid1, 1, ['foo'])
+        result = await task
+        assert result == {'responses': {sid1: 'foo'}, 'missing': []}
+
+    async def test_call_room_duplicate_ack(self, eio):
+        s = self._get_call_room_server(eio)
+        sid1 = await s.manager.connect('eio1', '/')
+        await s.enter_room(sid1, 'room')
+        task = asyncio.create_task(s.call_room(
+            'foo', room='room', timeout=5))
+        await self._wait_for_callbacks(s, [sid1])
+        await s.manager.trigger_callback(sid1, 1, ['foo'])
+        # a duplicate acknowledgement is ignored and does not fail
+        await s.manager.trigger_callback(sid1, 1, ['foo'])
+        result = await task
+        assert result == {'responses': {sid1: 'foo'}, 'missing': []}
+
+    async def test_call_room_without_async_handlers(self, eio):
+        s = async_server.AsyncServer(async_handlers=False)
+        with pytest.raises(RuntimeError):
+            await s.call_room('foo', room='room', timeout=12)
+
+    async def test_call_room_with_pubsub_manager(self, eio):
+        s = async_server.AsyncServer(
+            client_manager=async_pubsub_manager.AsyncPubSubManager())
+        with pytest.raises(NotImplementedError):
+            await s.call_room('foo', room='room')
 
     async def test_enter_room(self, eio):
         mgr = self._get_mock_manager()

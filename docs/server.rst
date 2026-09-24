@@ -356,6 +356,23 @@ the client will be passed as arguments to this function::
 
     sio.emit('my event', {'data': 'foobar'}, to=user_sid, callback=my_callback)
 
+To request acknowledgements from all the clients in a room, the
+:func:`socketio.Server.call_room` method can be used. This method emits the
+event to the clients that are in the room at the time of the call, and waits
+until all of them acknowledge the event or a timeout expires. The return
+value is a dict with the responses of the clients that acknowledged the
+event, keyed by their session IDs, plus the list of session IDs of the
+clients that did not respond in time::
+
+    result = sio.call_room('my event', {'data': 'foobar'}, room='my room')
+    for sid, response in result['responses'].items():
+        print(f'{sid} responded: {response}')
+    for sid in result['missing']:
+        print(f'{sid} did not respond')
+
+Note that the ``call_room()`` method is only supported by the default
+in-memory client manager.
+
 Rooms
 -----
 

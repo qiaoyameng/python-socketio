@@ -163,6 +163,13 @@ class BaseManager:
         self.callbacks[sid][id] = callback
         return id
 
+    def _remove_ack_callback(self, sid, id):
+        """Remove a pending ACK callback, if it is still registered."""
+        try:
+            del self.callbacks[sid][id]
+        except KeyError:
+            pass
+
     def _get_logger(self):
         """Get the appropriate logger
 

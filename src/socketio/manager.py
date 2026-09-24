@@ -67,6 +67,34 @@ class Manager(base_manager.BaseManager):
         """Register a client disconnect from a namespace."""
         return self.basic_disconnect(sid, namespace)
 
+    def emit_room_with_ack(self, event, data, namespace, room, callback):
+        """Emit a message to a room and register an ACK callback for each
+        recipient.
+
+        The set of recipients is frozen at the time of this call. The
+        ``callback`` argument is a callable that receives a recipient sid and
+        must return the ACK callback to register for that client.
+
+        Returns a dict that maps each recipient sid to its ACK id.
+        """
+        if isinstance(data, tuple):
+            # tuples are expanded to multiple arguments, everything else is
+            # sent as a single argument
+            data = list(data)
+        elif data is not None:
+            data = [data]
+        else:
+            data = []
+        ack_ids = {}
+        for sid, eio_sid in self.get_participants(namespace, room):
+            id = self._generate_ack_id(sid, callback(sid))
+            pkt = self.server.packet_class(
+                packet.EVENT, namespace=namespace, data=[event] + data,
+                id=id)
+            self.server._send_packet(eio_sid, pkt)
+            ack_ids[sid] = id
+        return ack_ids
+
     def enter_room(self, sid, namespace, room, eio_sid=None):
         """Add a client to a room."""
         return self.basic_enter_room(sid, namespace, room, eio_sid=eio_sid)

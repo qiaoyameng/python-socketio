@@ -92,6 +92,11 @@ class PubSubManager(Manager):
         self._handle_emit(message)  # handle in this host
         self._publish(message)  # notify other hosts
 
+    def emit_room_with_ack(self, event, data, namespace, room, callback):
+        raise NotImplementedError(
+            'Broadcasting with acknowledgements is not supported by this '
+            'client manager.')
+
     def can_disconnect(self, sid, namespace):
         if self.is_connected(sid, namespace):
             # client is in this server, so we can disconnect directly

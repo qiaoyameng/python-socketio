@@ -1,4 +1,5 @@
 import logging
+import threading
 
 import engineio
 
@@ -268,6 +269,83 @@ class Server(base_server.BaseServer):
         return callback_args[0] if len(callback_args[0]) > 1 \
             else callback_args[0][0] if len(callback_args[0]) == 1 \
             else None
+
+    def call_room(self, event, data=None, room=None, namespace=None,
+                  timeout=60):
+        """Emit a custom event to a room and wait for the responses.
+
+        This method emits an event to all the clients in a room and waits
+        until all of them acknowledge it or the timeout expires. The set of
+        recipients is frozen when the event is sent: clients that join the
+        room after this call is made are not included, while clients that
+        leave the room but remain connected can still acknowledge the event.
+
+        The return value is a dict with two keys: ``'responses'`` contains a
+        dict with the response of each client that acknowledged the event,
+        keyed by the client's session ID, and ``'missing'`` contains a list
+        with the session IDs of the clients that did not acknowledge the
+        event before the timeout expired.
+
+        :param event: The event name. It can be any string. The event names
+                      ``'connect'``, ``'message'`` and ``'disconnect'`` are
+                      reserved and should not be used.
+        :param data: The data to send to the clients. Data can be of
+                     type ``str``, ``bytes``, ``list`` or ``dict``. To send
+                     multiple arguments, use a tuple where each element is of
+                     one of the types indicated above.
+        :param room: The room to send the event to. If this argument is
+                     omitted the event is sent to all the clients connected
+                     to the namespace.
+        :param namespace: The Socket.IO namespace for the event. If this
+                          argument is omitted the event is emitted to the
+                          default namespace.
+        :param timeout: The waiting timeout. Clients that do not acknowledge
+                        the event before the timeout expires are reported in
+                        the ``'missing'`` list of the return value.
+
+        Note: this method is not thread safe. If multiple threads are
+        emitting at the same time to the same client, then messages composed
+        of multiple packets may end up being sent in an incorrect sequence.
+        Use standard concurrency solutions (such as a Lock object) to prevent
+        this situation.
+        """
+        if not self.async_handlers:
+            raise RuntimeError(
+                'Cannot use call_room() when async_handlers is False.')
+        namespace = namespace or '/'
+        callback_event = self.eio.create_event()
+        responses = {}
+        pending = set()
+        sending = True
+        lock = threading.Lock()
+
+        def make_callback(sid):
+            def event_callback(*args):
+                with lock:
+                    responses[sid] = args if len(args) > 1 \
+                        else args[0] if len(args) == 1 else None
+                    pending.discard(sid)
+                    if not sending and not pending:
+                        callback_event.set()
+            return event_callback
+
+        ack_ids = self.manager.emit_room_with_ack(
+            event, data, namespace=namespace, room=room,
+            callback=make_callback)
+        with lock:
+            pending.update(ack_ids.keys())
+            pending.difference_update(responses.keys())
+            sending = False
+            if not pending:
+                callback_event.set()
+        callback_event.wait(timeout=timeout)
+        with lock:
+            missing = [sid for sid in ack_ids if sid in pending]
+        for sid in missing:
+            # remove the callbacks of clients that did not respond, so that
+            # a late acknowledgement does not interfere with future calls
+            self.manager._remove_ack_callback(sid, ack_ids[sid])
+        return {'responses': responses, 'missing': missing}
 
     def enter_room(self, sid, room, namespace=None):
         """Enter a room.

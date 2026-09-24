@@ -95,6 +95,12 @@ class AsyncPubSubManager(AsyncManager):
         await self._handle_emit(message)  # handle in this host
         await self._publish(message)  # notify other hosts
 
+    async def emit_room_with_ack(self, event, data, namespace, room,
+                                 callback):
+        raise NotImplementedError(
+            'Broadcasting with acknowledgements is not supported by this '
+            'client manager.')
+
     async def can_disconnect(self, sid, namespace):
         if self.is_connected(sid, namespace):
             # client is in this server, so we can disconnect directly

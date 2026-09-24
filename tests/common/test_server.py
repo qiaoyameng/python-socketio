@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 from unittest import mock
 from datetime import datetime, timezone, timedelta
 
@@ -10,6 +12,7 @@ from socketio import exceptions
 from socketio import msgpack_packet
 from socketio import namespace
 from socketio import packet
+from socketio import pubsub_manager
 from socketio import server
 from socketio.msgpack_packet import MsgPackPacket
 
@@ -217,6 +220,150 @@ class TestServer:
         s = server.Server(client_manager=mgr, async_handlers=False)
         with pytest.raises(RuntimeError):
             s.call('foo', sid='123', timeout=12)
+
+    def _call_room_in_thread(self, s, result, **kwargs):
+        def call():
+            result.update(s.call_room('foo', data={'a': 'b'}, **kwargs))
+
+        t = threading.Thread(target=call)
+        t.start()
+        return t
+
+    def _wait_for_callbacks(self, s, sids, ack_id=1):
+        for _ in range(100):
+            if all(ack_id in s.manager.callbacks.get(sid, {})
+                   for sid in sids):
+                return
+            time.sleep(0.01)
+        raise AssertionError('callbacks were not registered')
+
+    def test_call_room(self, eio):
+        s = server.Server()
+        s.eio.create_event.return_value = threading.Event()
+        sid1 = s.manager.connect('eio1', '/')
+        sid2 = s.manager.connect('eio2', '/')
+        s.enter_room(sid1, 'room')
+        s.enter_room(sid2, 'room')
+        result = {}
+        t = self._call_room_in_thread(s, result, room='room', timeout=5)
+        self._wait_for_callbacks(s, [sid1, sid2])
+        # acknowledge out of order
+        s.manager.trigger_callback(sid2, 1, ['bar'])
+        s.manager.trigger_callback(sid1, 1, ['baz'])
+        t.join(5)
+        assert result == {'responses': {sid1: 'baz', sid2: 'bar'},
+                          'missing': []}
+        assert s.eio.send.call_count == 2
+
+    def test_call_room_empty_room(self, eio):
+        s = server.Server()
+        s.eio.create_event.return_value = threading.Event()
+        start = time.time()
+        assert s.call_room('foo', room='empty', timeout=60) == {
+            'responses': {}, 'missing': []}
+        assert time.time() - start < 5
+        s.eio.send.assert_not_called()
+
+    def test_call_room_partial_timeout_and_late_ack(self, eio):
+        s = server.Server()
+        s.eio.create_event.side_effect = \
+            lambda: threading.Event()
+        sid1 = s.manager.connect('eio1', '/')
+        sid2 = s.manager.connect('eio2', '/')
+        s.enter_room(sid1, 'room')
+        s.enter_room(sid2, 'room')
+        result = {}
+        t = self._call_room_in_thread(s, result, room='room', timeout=0.2)
+        self._wait_for_callbacks(s, [sid1, sid2])
+        s.manager.trigger_callback(sid1, 1, ['foo'])
+        t.join(5)
+        assert result == {'responses': {sid1: 'foo'}, 'missing': [sid2]}
+        # the callback of the client that did not respond is removed
+        assert 1 not in s.manager.callbacks[sid2]
+        # a late acknowledgement is ignored and does not fail
+        s.manager.trigger_callback(sid2, 1, ['too late'])
+        # a second call is not affected by the previous one
+        result2 = {}
+        t = self._call_room_in_thread(s, result2, room='room', timeout=5)
+        self._wait_for_callbacks(s, [sid1, sid2], ack_id=2)
+        s.manager.trigger_callback(sid2, 2, ['bar'])
+        s.manager.trigger_callback(sid1, 2, ['baz'])
+        t.join(5)
+        assert result2 == {'responses': {sid1: 'baz', sid2: 'bar'},
+                          'missing': []}
+
+    def test_call_room_disconnect(self, eio):
+        s = server.Server()
+        s.eio.create_event.return_value = threading.Event()
+        sid1 = s.manager.connect('eio1', '/')
+        sid2 = s.manager.connect('eio2', '/')
+        s.enter_room(sid1, 'room')
+        s.enter_room(sid2, 'room')
+        result = {}
+        t = self._call_room_in_thread(s, result, room='room', timeout=0.2)
+        self._wait_for_callbacks(s, [sid1, sid2])
+        s.manager.trigger_callback(sid1, 1, ['foo'])
+        s.manager.disconnect(sid2, '/')
+        assert sid2 not in s.manager.callbacks
+        t.join(5)
+        assert result == {'responses': {sid1: 'foo'}, 'missing': [sid2]}
+
+    def test_call_room_leave_room_still_acks(self, eio):
+        s = server.Server()
+        s.eio.create_event.return_value = threading.Event()
+        sid1 = s.manager.connect('eio1', '/')
+        sid2 = s.manager.connect('eio2', '/')
+        s.enter_room(sid1, 'room')
+        s.enter_room(sid2, 'room')
+        result = {}
+        t = self._call_room_in_thread(s, result, room='room', timeout=5)
+        self._wait_for_callbacks(s, [sid1, sid2])
+        # a client that leaves the room can still acknowledge
+        s.leave_room(sid2, 'room')
+        s.manager.trigger_callback(sid2, 1, ['bar'])
+        s.manager.trigger_callback(sid1, 1, ['baz'])
+        t.join(5)
+        assert result == {'responses': {sid1: 'baz', sid2: 'bar'},
+                          'missing': []}
+
+    def test_call_room_join_after_send_not_included(self, eio):
+        s = server.Server()
+        s.eio.create_event.return_value = threading.Event()
+        sid1 = s.manager.connect('eio1', '/')
+        s.enter_room(sid1, 'room')
+        result = {}
+        t = self._call_room_in_thread(s, result, room='room', timeout=5)
+        self._wait_for_callbacks(s, [sid1])
+        # a client that joins after the call is not a recipient
+        sid2 = s.manager.connect('eio2', '/')
+        s.enter_room(sid2, 'room')
+        s.manager.trigger_callback(sid1, 1, ['foo'])
+        t.join(5)
+        assert result == {'responses': {sid1: 'foo'}, 'missing': []}
+
+    def test_call_room_duplicate_ack(self, eio):
+        s = server.Server()
+        s.eio.create_event.return_value = threading.Event()
+        sid1 = s.manager.connect('eio1', '/')
+        s.enter_room(sid1, 'room')
+        result = {}
+        t = self._call_room_in_thread(s, result, room='room', timeout=5)
+        self._wait_for_callbacks(s, [sid1])
+        s.manager.trigger_callback(sid1, 1, ['foo'])
+        # a duplicate acknowledgement is ignored and does not fail
+        s.manager.trigger_callback(sid1, 1, ['foo'])
+        t.join(5)
+        assert result == {'responses': {sid1: 'foo'}, 'missing': []}
+
+    def test_call_room_without_async_handlers(self, eio):
+        s = server.Server(async_handlers=False)
+        with pytest.raises(RuntimeError):
+            s.call_room('foo', room='room', timeout=12)
+
+    def test_call_room_with_pubsub_manager(self, eio):
+        s = server.Server(client_manager=pubsub_manager.PubSubManager())
+        with pytest.raises(NotImplementedError):
+            s.call_room('foo', room='room')
 
     def test_enter_room(self, eio):
         mgr = mock.MagicMock()
