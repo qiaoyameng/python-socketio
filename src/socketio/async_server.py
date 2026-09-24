@@ -287,6 +287,103 @@ class AsyncServer(base_server.BaseServer):
             else callback_args[0][0] if len(callback_args[0]) == 1 \
             else None
 
+    async def call_many(self, event, data=None, to=None, room=None,
+                        skip_sid=None, namespace=None, timeout=60):
+        """Emit a custom event to a room and wait for the responses from all
+        the recipients.
+
+        This method issues an emit with a callback addressed to all the
+        clients that are in the given room at the time of the call, and waits
+        for all the callbacks to be invoked before returning. Clients that
+        join the room after the emit is sent are not included, while clients
+        that leave the room but remain connected can still acknowledge the
+        event. Clients that do not acknowledge the event before the timeout
+        are reported as timed out, instead of raising an exception.
+
+        :param event: The event name. It can be any string. The event names
+                      ``'connect'``, ``'message'`` and ``'disconnect'`` are
+                      reserved and should not be used.
+        :param data: The data to send to the client or clients. Data can be of
+                     type ``str``, ``bytes``, ``list`` or ``dict``. To send
+                     multiple arguments, use a tuple where each element is of
+                     one of the types indicated above.
+        :param to: The recipient room. If this argument is omitted the event
+                   is broadcasted to all connected clients.
+        :param room: Alias for the ``to`` parameter.
+        :param skip_sid: The session ID of a client to skip when broadcasting
+                         to a room or to all clients. This can be used to
+                         prevent a message from being sent to the sender. To
+                         skip multiple sids, pass a list.
+        :param namespace: The Socket.IO namespace for the event. If this
+                          argument is omitted the event is emitted to the
+                          default namespace.
+        :param timeout: The waiting timeout. If the timeout is reached before
+                        all the clients acknowledge the event, then the
+                        clients that are missing a response are reported as
+                        timed out.
+
+        The return value is a tuple with two elements. The first element is a
+        dict with the responses received, keyed by the session ID of each
+        client. The second element is a list with the session IDs of the
+        clients that did not respond before the timeout.
+
+        Note: this method is only supported with the default in-memory client
+        manager. When a message queue manager is in use a
+        ``NotImplementedError`` exception is raised.
+
+        Note: this method is not designed to be used concurrently. If multiple
+        tasks are emitting at the same time to the same client connection,
+        then messages composed of multiple packets may end up being sent in an
+        incorrect sequence. Use standard concurrency solutions (such as a Lock
+        object) to prevent this situation.
+
+        Note 2: this method is a coroutine.
+        """
+        if not self.async_handlers:
+            raise RuntimeError(
+                'Cannot use call_many() when async_handlers is False.')
+        namespace = namespace or '/'
+        room = to or room
+        self.logger.info('emitting event "%s" with ack to %s [%s]', event,
+                         room or 'all', namespace)
+        responses = {}
+        ack_events = {}
+
+        def event_callback(sid, *args):
+            responses[sid] = args
+            if sid in ack_events:
+                ack_events[sid].set()
+
+        acks = await self.manager.emit_with_ack(
+            event, data, namespace, room=room, skip_sid=skip_sid,
+            callback=event_callback)
+        for sid in acks:
+            ack_events[sid] = asyncio.Event()
+            if sid in responses:
+                # the response arrived before the event was created
+                ack_events[sid].set()
+
+        async def wait_for_acks():
+            for ack_event in ack_events.values():
+                await ack_event.wait()
+
+        try:
+            await asyncio.wait_for(wait_for_acks(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        timed_out = []
+        for sid, id in acks.items():
+            if sid not in responses:
+                timed_out.append(sid)
+                # remove the pending callback, so that a late response from
+                # this client does not interfere with future calls
+                self.manager._remove_ack_callback(sid, id)
+        return {
+            sid: args if len(args) > 1 else args[0] if len(args) == 1
+            else None
+            for sid, args in responses.items()
+        }, timed_out
+
     async def enter_room(self, sid, room, namespace=None):
         """Enter a room.
 

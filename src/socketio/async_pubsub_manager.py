@@ -52,6 +52,12 @@ class AsyncPubSubManager(AsyncManager):
             self.thread = self.server.start_background_task(self._thread)
         self._get_logger().info(self.name + ' backend initialized.')
 
+    async def emit_with_ack(self, event, data, namespace, room=None,
+                            skip_sid=None, callback=None):
+        raise NotImplementedError(
+            'This client manager does not support emitting with '
+            'acknowledgements addressed to a room.')
+
     async def emit(self, event, data, namespace=None, room=None, skip_sid=None,
                    callback=None, to=None, **kwargs):
         """Emit a message to a single client, a room, or all the clients

@@ -64,6 +64,55 @@ class AsyncManager(BaseManager):
             return
         await asyncio.wait(tasks)
 
+    async def emit_with_ack(self, event, data, namespace, room=None,
+                            skip_sid=None, callback=None):
+        """Emit a message to a room or to all clients and register an
+        individual callback for each recipient.
+
+        The list of recipients is determined at the time of the call and
+        does not change even if clients join or leave the room while the
+        acknowledgements are pending.
+
+        The callback is invoked as ``callback(sid, *args)`` each time a
+        recipient acknowledges the event.
+
+        Returns a dict that maps the sid of each recipient to the ack id
+        assigned to it.
+
+        Note: this method is a coroutine.
+        """
+        if namespace not in self.rooms:
+            return {}
+        if isinstance(data, tuple):
+            # tuples are expanded to multiple arguments, everything else is
+            # sent as a single argument
+            data = list(data)
+        elif data is not None:
+            data = [data]
+        else:
+            data = []
+        if not isinstance(skip_sid, list):
+            skip_sid = [skip_sid]
+        acks = {}
+        tasks = []
+        for sid, eio_sid in self.get_participants(namespace, room):
+            if sid in skip_sid:
+                continue
+
+            def ack_callback(*args, sid=sid):
+                callback(sid, *args)
+
+            id = self._generate_ack_id(sid, ack_callback)
+            pkt = self.server.packet_class(
+                packet.EVENT, namespace=namespace, data=[event] + data,
+                id=id)
+            acks[sid] = id
+            tasks.append(asyncio.create_task(
+                self.server._send_packet(eio_sid, pkt)))
+        if tasks:
+            await asyncio.wait(tasks)
+        return acks
+
     async def connect(self, eio_sid, namespace):
         """Register a client connection to a namespace.
 

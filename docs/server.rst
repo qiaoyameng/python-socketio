@@ -345,6 +345,20 @@ provided by the client::
 
     response = sio.call('my event', {'data': 'foobar'}, to=user_sid)
 
+When an event needs to be acknowledged by all the clients in a room, the
+:func:`socketio.Server.call_many` method can be used instead. This method
+emits the event to all the clients that are in the room at the time of the
+call, and waits until all of them acknowledge the event or the timeout
+expires. The return value is a tuple with a dict of responses keyed by the
+session ID of each client, and a list with the session IDs of the clients
+that did not respond before the timeout::
+
+    responses, timed_out = sio.call_many('my event', {'data': 'foobar'},
+                                         to='my_room')
+
+Note that the ``call_many()`` method is only supported when the default
+in-memory client manager is used.
+
 A much more primitive acknowledgement solution uses callback functions. The
 :func:`socketio.Server.emit` method has an optional ``callback`` argument that
 can be set to a callable. If this argument is given, the callable will be

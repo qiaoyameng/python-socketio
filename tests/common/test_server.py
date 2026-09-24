@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 from unittest import mock
 from datetime import datetime, timezone, timedelta
 
@@ -10,6 +12,7 @@ from socketio import exceptions
 from socketio import msgpack_packet
 from socketio import namespace
 from socketio import packet
+from socketio import pubsub_manager
 from socketio import server
 from socketio.msgpack_packet import MsgPackPacket
 
@@ -217,6 +220,128 @@ class TestServer:
         s = server.Server(client_manager=mgr, async_handlers=False)
         with pytest.raises(RuntimeError):
             s.call('foo', sid='123', timeout=12)
+
+    def _connect_to_room(self, s, eio_sid, room):
+        s._handle_eio_connect(eio_sid, 'environ')
+        s._handle_eio_message(eio_sid, '0')
+        sid = s.manager.sid_from_eio_sid(eio_sid, '/')
+        if room is not None:
+            s.enter_room(sid, room)
+        return sid
+
+    def _call_many_in_thread(self, s, *args, **kwargs):
+        result = {}
+
+        def run():
+            result['value'] = s.call_many(*args, **kwargs)
+
+        t = threading.Thread(target=run)
+        t.start()
+        return t, result
+
+    def _wait_for_packets(self, s, count):
+        for _ in range(200):
+            if s.eio.send.call_count >= count:
+                return
+            time.sleep(0.01)
+        raise AssertionError('timed out waiting for packets to be sent')
+
+    def test_call_many(self, eio):
+        s = server.Server()
+        s.eio.create_event.side_effect = threading.Event
+        sid1 = self._connect_to_room(s, '123', 'room')
+        sid2 = self._connect_to_room(s, '456', 'room')
+        sid3 = self._connect_to_room(s, '789', 'room')
+        t, result = self._call_many_in_thread(
+            s, 'my event', {'a': 'b'}, room='room')
+        self._wait_for_packets(s, 6)
+        # a client that joins the room after the emit is not a recipient
+        sid4 = self._connect_to_room(s, '000', 'room')
+        # a client that leaves the room can still acknowledge
+        s.leave_room(sid2, 'room')
+        # acknowledge out of order
+        s._handle_ack('789', '/', 1, ['baz'])
+        s._handle_ack('123', '/', 1, ['foo'])
+        s._handle_ack('456', '/', 1, ['bar'])
+        t.join(timeout=5)
+        responses, timed_out = result['value']
+        assert responses == {sid1: 'foo', sid2: 'bar', sid3: 'baz'}
+        assert timed_out == []
+        assert sid4 not in s.manager.callbacks
+
+    def test_call_many_empty_room(self, eio):
+        s = server.Server()
+        s.eio.create_event.side_effect = threading.Event
+        responses, timed_out = s.call_many('my event', room='room', timeout=1)
+        assert responses == {}
+        assert timed_out == []
+
+    def test_call_many_partial_timeout(self, eio):
+        s = server.Server()
+        s.eio.create_event.side_effect = threading.Event
+        sid1 = self._connect_to_room(s, '123', 'room')
+        sid2 = self._connect_to_room(s, '456', 'room')
+        t, result = self._call_many_in_thread(
+            s, 'my event', room='room', timeout=0.2)
+        self._wait_for_packets(s, 4)
+        s._handle_ack('123', '/', 1, ['foo'])
+        t.join(timeout=5)
+        responses, timed_out = result['value']
+        assert responses == {sid1: 'foo'}
+        assert timed_out == [sid2]
+        # the pending callback for the timed out client was removed
+        assert 1 not in s.manager.callbacks[sid2]
+        # a late ack does not interfere with the next call
+        s._handle_ack('456', '/', 1, ['bar'])
+        t, result = self._call_many_in_thread(
+            s, 'my event', room='room', timeout=1)
+        self._wait_for_packets(s, 6)
+        s._handle_ack('123', '/', 2, ['foo2'])
+        s._handle_ack('456', '/', 2, ['bar2'])
+        t.join(timeout=5)
+        responses, timed_out = result['value']
+        assert responses == {sid1: 'foo2', sid2: 'bar2'}
+        assert timed_out == []
+
+    def test_call_many_disconnect(self, eio):
+        s = server.Server()
+        s.eio.create_event.side_effect = threading.Event
+        sid1 = self._connect_to_room(s, '123', 'room')
+        sid2 = self._connect_to_room(s, '456', 'room')
+        t, result = self._call_many_in_thread(
+            s, 'my event', room='room', timeout=0.2)
+        self._wait_for_packets(s, 4)
+        s._handle_ack('123', '/', 1, ['foo'])
+        s.manager.disconnect(sid2, '/')
+        t.join(timeout=5)
+        responses, timed_out = result['value']
+        assert responses == {sid1: 'foo'}
+        assert timed_out == [sid2]
+        # the disconnect removed the pending callbacks for this client
+        assert sid2 not in s.manager.callbacks
+
+    def test_call_many_duplicate_ack(self, eio):
+        s = server.Server()
+        s.eio.create_event.side_effect = threading.Event
+        sid1 = self._connect_to_room(s, '123', 'room')
+        t, result = self._call_many_in_thread(s, 'my event', room='room')
+        self._wait_for_packets(s, 2)
+        s._handle_ack('123', '/', 1, ['foo'])
+        s._handle_ack('123', '/', 1, ['foo'])  # duplicate ack is ignored
+        t.join(timeout=5)
+        responses, timed_out = result['value']
+        assert responses == {sid1: 'foo'}
+        assert timed_out == []
+
+    def test_call_many_without_async_handlers(self, eio):
+        s = server.Server(async_handlers=False)
+        with pytest.raises(RuntimeError):
+            s.call_many('foo', room='room')
+
+    def test_call_many_with_unsupported_manager(self, eio):
+        s = server.Server(client_manager=pubsub_manager.PubSubManager())
+        with pytest.raises(NotImplementedError):
+            s.call_many('foo', room='room')
 
     def test_enter_room(self, eio):
         mgr = mock.MagicMock()

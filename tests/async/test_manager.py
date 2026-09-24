@@ -326,6 +326,34 @@ class TestAsyncManager:
         pkt = self.bm.server._send_packet.await_args_list[0][0][1]
         assert pkt.encode() == '2/foo,11["my event",{"foo":"bar"}]'
 
+    async def test_emit_with_ack(self):
+        sid1 = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = await self.bm.connect('456', '/foo')
+        await self.bm.enter_room(sid2, '/foo', 'bar')
+        callback = mock.MagicMock()
+        acks = await self.bm.emit_with_ack(
+            'my event', {'foo': 'bar'}, namespace='/foo', room='bar',
+            callback=callback)
+        assert acks == {sid1: 1, sid2: 1}
+        assert self.bm.server._send_packet.await_count == 2
+        assert self.bm.server._send_packet.await_args_list[0][0][0] == '123'
+        assert self.bm.server._send_packet.await_args_list[1][0][0] == '456'
+        pkt = self.bm.server._send_packet.await_args_list[0][0][1]
+        assert pkt.encode() == '2/foo,1["my event",{"foo":"bar"}]'
+        pkt = self.bm.server._send_packet.await_args_list[1][0][1]
+        assert pkt.encode() == '2/foo,1["my event",{"foo":"bar"}]'
+        await self.bm.trigger_callback(sid1, 1, ['foo'])
+        await self.bm.trigger_callback(sid2, 1, ['bar', 'baz'])
+        callback.assert_any_call(sid1, 'foo')
+        callback.assert_any_call(sid2, 'bar', 'baz')
+
+    async def test_emit_with_ack_empty_room(self):
+        assert await self.bm.emit_with_ack(
+            'my event', None, namespace='/foo', room='bar',
+            callback='cb') == {}
+        assert self.bm.server._send_packet.await_count == 0
+
     async def test_emit_to_invalid_room(self):
         await self.bm.emit('my event', {'foo': 'bar'}, namespace='/',
                            room='123')

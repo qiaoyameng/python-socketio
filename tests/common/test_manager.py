@@ -320,6 +320,55 @@ class TestBaseManager:
         pkt = self.bm.server._send_packet.call_args_list[0][0][1]
         assert pkt.encode() == '2/foo,11["my event",{"foo":"bar"}]'
 
+    def test_emit_with_ack(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'bar')
+        callback = mock.MagicMock()
+        acks = self.bm.emit_with_ack(
+            'my event', {'foo': 'bar'}, namespace='/foo', room='bar',
+            callback=callback)
+        assert acks == {sid1: 1, sid2: 1}
+        assert self.bm.server._send_packet.call_count == 2
+        assert self.bm.server._send_packet.call_args_list[0][0][0] == '123'
+        assert self.bm.server._send_packet.call_args_list[1][0][0] == '456'
+        pkt = self.bm.server._send_packet.call_args_list[0][0][1]
+        assert pkt.encode() == '2/foo,1["my event",{"foo":"bar"}]'
+        pkt = self.bm.server._send_packet.call_args_list[1][0][1]
+        assert pkt.encode() == '2/foo,1["my event",{"foo":"bar"}]'
+        self.bm.trigger_callback(sid1, 1, ['foo'])
+        self.bm.trigger_callback(sid2, 1, ['bar', 'baz'])
+        callback.assert_any_call(sid1, 'foo')
+        callback.assert_any_call(sid2, 'bar', 'baz')
+
+    def test_emit_with_ack_skip_sid(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'bar')
+        acks = self.bm.emit_with_ack(
+            'my event', None, namespace='/foo', room='bar', skip_sid=sid1,
+            callback='cb')
+        assert acks == {sid2: 1}
+        assert self.bm.server._send_packet.call_count == 1
+        assert self.bm.server._send_packet.call_args_list[0][0][0] == '456'
+
+    def test_emit_with_ack_empty_room(self):
+        assert self.bm.emit_with_ack(
+            'my event', None, namespace='/foo', room='bar',
+            callback='cb') == {}
+        assert self.bm.server._send_packet.call_count == 0
+
+    def test_remove_ack_callback(self):
+        sid = self.bm.connect('123', '/foo')
+        id = self.bm._generate_ack_id(sid, 'f')
+        self.bm._remove_ack_callback(sid, id)
+        assert id not in self.bm.callbacks[sid]
+        # removing a callback that does not exist does not raise
+        self.bm._remove_ack_callback(sid, id)
+        self.bm._remove_ack_callback('xxx', id)
+
     def test_emit_to_invalid_room(self):
         self.bm.emit('my event', {'foo': 'bar'}, namespace='/', room='123')
 

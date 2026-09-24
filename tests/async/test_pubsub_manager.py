@@ -69,6 +69,9 @@ class TestAsyncPubSubManager:
             }
         )
 
+    async def test_emit_with_ack_not_supported(self):
+        with pytest.raises(NotImplementedError):
+            await self.pm.emit_with_ack('foo', None, '/')
     async def test_emit_binary(self):
         await self.pm.emit('foo', b'bar')
         self.pm._publish.assert_awaited_once_with(

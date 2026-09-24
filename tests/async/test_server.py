@@ -7,6 +7,7 @@ from engineio import json
 from engineio import packet as eio_packet
 import pytest
 
+from socketio import async_pubsub_manager
 from socketio import async_server
 from socketio import async_namespace
 from socketio import exceptions
@@ -215,6 +216,104 @@ class TestAsyncServer:
         )
         with pytest.raises(RuntimeError):
             await s.call('foo', sid='123', timeout=12)
+
+    async def _connect_to_room(self, s, eio_sid, room):
+        s.eio.send = mock.AsyncMock()
+        await s._handle_eio_connect(eio_sid, 'environ')
+        await s._handle_eio_message(eio_sid, '0')
+        sid = s.manager.sid_from_eio_sid(eio_sid, '/')
+        if room is not None:
+            await s.enter_room(sid, room)
+        return sid
+
+    async def test_call_many(self, eio):
+        s = async_server.AsyncServer()
+        sid1 = await self._connect_to_room(s, '123', 'room')
+        sid2 = await self._connect_to_room(s, '456', 'room')
+        sid3 = await self._connect_to_room(s, '789', 'room')
+        task = asyncio.create_task(
+            s.call_many('my event', {'a': 'b'}, room='room'))
+        await asyncio.sleep(0.1)
+        # a client that joins the room after the emit is not a recipient
+        sid4 = await self._connect_to_room(s, '000', 'room')
+        # a client that leaves the room can still acknowledge
+        await s.leave_room(sid2, 'room')
+        # acknowledge out of order
+        await s._handle_ack('789', '/', 1, ['baz'])
+        await s._handle_ack('123', '/', 1, ['foo'])
+        await s._handle_ack('456', '/', 1, ['bar'])
+        responses, timed_out = await task
+        assert responses == {sid1: 'foo', sid2: 'bar', sid3: 'baz'}
+        assert timed_out == []
+        assert sid4 not in s.manager.callbacks
+
+    async def test_call_many_empty_room(self, eio):
+        s = async_server.AsyncServer()
+        responses, timed_out = await s.call_many(
+            'my event', room='room', timeout=1)
+        assert responses == {}
+        assert timed_out == []
+
+    async def test_call_many_partial_timeout(self, eio):
+        s = async_server.AsyncServer()
+        sid1 = await self._connect_to_room(s, '123', 'room')
+        sid2 = await self._connect_to_room(s, '456', 'room')
+        task = asyncio.create_task(
+            s.call_many('my event', room='room', timeout=0.2))
+        await asyncio.sleep(0.1)
+        await s._handle_ack('123', '/', 1, ['foo'])
+        responses, timed_out = await task
+        assert responses == {sid1: 'foo'}
+        assert timed_out == [sid2]
+        # the pending callback for the timed out client was removed
+        assert 1 not in s.manager.callbacks[sid2]
+        # a late ack does not interfere with the next call
+        await s._handle_ack('456', '/', 1, ['bar'])
+        task = asyncio.create_task(
+            s.call_many('my event', room='room', timeout=1))
+        await asyncio.sleep(0.1)
+        await s._handle_ack('123', '/', 2, ['foo2'])
+        await s._handle_ack('456', '/', 2, ['bar2'])
+        responses, timed_out = await task
+        assert responses == {sid1: 'foo2', sid2: 'bar2'}
+        assert timed_out == []
+
+    async def test_call_many_disconnect(self, eio):
+        s = async_server.AsyncServer()
+        sid1 = await self._connect_to_room(s, '123', 'room')
+        sid2 = await self._connect_to_room(s, '456', 'room')
+        task = asyncio.create_task(
+            s.call_many('my event', room='room', timeout=0.2))
+        await asyncio.sleep(0.1)
+        await s._handle_ack('123', '/', 1, ['foo'])
+        await s.manager.disconnect(sid2, '/')
+        responses, timed_out = await task
+        assert responses == {sid1: 'foo'}
+        assert timed_out == [sid2]
+        # the disconnect removed the pending callbacks for this client
+        assert sid2 not in s.manager.callbacks
+
+    async def test_call_many_duplicate_ack(self, eio):
+        s = async_server.AsyncServer()
+        sid1 = await self._connect_to_room(s, '123', 'room')
+        task = asyncio.create_task(s.call_many('my event', room='room'))
+        await asyncio.sleep(0.1)
+        await s._handle_ack('123', '/', 1, ['foo'])
+        await s._handle_ack('123', '/', 1, ['foo'])  # duplicate is ignored
+        responses, timed_out = await task
+        assert responses == {sid1: 'foo'}
+        assert timed_out == []
+
+    async def test_call_many_without_async_handlers(self, eio):
+        s = async_server.AsyncServer(async_handlers=False)
+        with pytest.raises(RuntimeError):
+            await s.call_many('foo', room='room')
+
+    async def test_call_many_with_unsupported_manager(self, eio):
+        s = async_server.AsyncServer(
+            client_manager=async_pubsub_manager.AsyncPubSubManager())
+        with pytest.raises(NotImplementedError):
+            await s.call_many('foo', room='room')
 
     async def test_enter_room(self, eio):
         mgr = self._get_mock_manager()

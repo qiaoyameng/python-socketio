@@ -36,6 +36,10 @@ class TestPubSubManager:
             self.pm._thread
         )
 
+    def test_emit_with_ack_not_supported(self):
+        with pytest.raises(NotImplementedError):
+            self.pm.emit_with_ack('foo', None, '/')
+
     def test_custom_init(self):
         pubsub = pubsub_manager.PubSubManager(channel='foo')
         assert pubsub.channel == 'foo'
