@@ -317,6 +317,44 @@ class TestPubSubManager:
             with pytest.raises(ValueError):
                 self.pm.emit('foo', 'bar', callback='cb')
 
+    def test_emit_with_callback_and_room_selector(self):
+        # callbacks cannot be combined with a multi-room selector
+        with pytest.raises(ValueError):
+            self.pm.emit('foo', 'bar', room={'union': ['a', 'b']},
+                         callback='cb')
+        with pytest.raises(ValueError):
+            self.pm.emit('foo', 'bar', room=['a', 'b'], callback='cb')
+        self.pm._publish.assert_not_called()
+
+    def test_emit_with_room_selector(self):
+        # the selector is propagated to the other hosts, which resolve it
+        # against their own local rooms
+        self.pm.emit('foo', 'bar',
+                     room={'intersection': ['a', 'b'], 'exclude': 'c'})
+        self.pm._publish.assert_called_once_with(
+            {
+                'method': 'emit',
+                'event': 'foo',
+                'binary': False,
+                'data': ['bar'],
+                'namespace': '/',
+                'room': {'intersection': ['a', 'b'], 'exclude': 'c'},
+                'skip_sid': None,
+                'callback': None,
+                'host_id': '123456',
+            }
+        )
+
+    def test_emit_with_invalid_room_selector(self):
+        with pytest.raises(ValueError):
+            self.pm.emit('foo', 'bar', room={'intersection': []})
+        with pytest.raises(ValueError):
+            self.pm.emit('foo', 'bar', room={'unknown': ['a']})
+        with pytest.raises(ValueError):
+            self.pm.emit('foo', 'bar', room={'exclude': 'a'})
+        # invalid selectors are rejected before anything is published
+        self.pm._publish.assert_not_called()
+
     def test_emit_with_ignore_queue(self):
         sid = self.pm.connect('123', '/')
         self.pm.emit(
@@ -835,3 +873,117 @@ class TestPubSubManager:
 
         packet.Packet.json = saved_json
         EIOPacket.json = saved_json
+
+    @staticmethod
+    def _make_linked_pair():
+        """Create two managers connected through a fake pub/sub channel."""
+        def make_manager():
+            id = 0
+
+            def generate_id():
+                nonlocal id
+                id += 1
+                return str(id)
+
+            mock_server = mock.MagicMock()
+            mock_server.eio.generate_id = generate_id
+            mock_server.packet_class = packet.Packet
+            pm = pubsub_manager.PubSubManager()
+            pm.set_server(mock_server)
+            pm.initialize()
+            return pm
+
+        managers = [make_manager(), make_manager()]
+        # the fake channel delivers emitted messages to the other host
+        managers[0]._publish = managers[1]._handle_emit
+        managers[1]._publish = managers[0]._handle_emit
+        return managers
+
+    def test_emit_selector_across_hosts(self):
+        pm1, pm2 = self._make_linked_pair()
+        sid1 = pm1.connect('eio-1a', '/')
+        pm1.enter_room(sid1, '/', 'project')
+        pm1.enter_room(sid1, '/', 'on-duty')
+        sid2 = pm2.connect('eio-2a', '/')
+        pm2.enter_room(sid2, '/', 'project')
+        pm2.enter_room(sid2, '/', 'on-duty')
+        sid3 = pm2.connect('eio-2b', '/')
+        pm2.enter_room(sid3, '/', 'project')
+        pm1.emit('foo', 'bar', namespace='/',
+                 room={'intersection': ['project', 'on-duty']})
+        # the local host delivers to its own matching client
+        assert pm1.server._send_eio_packet.call_count == 1
+        assert pm1.server._send_eio_packet.call_args_list[0][0][0] == 'eio-1a'
+        # the remote host resolves the selector against its own rooms, so
+        # only its client that is in both rooms receives the event
+        assert pm2.server._send_eio_packet.call_count == 1
+        assert pm2.server._send_eio_packet.call_args_list[0][0][0] == 'eio-2a'
+
+    def test_emit_selector_overlapping_members_across_hosts(self):
+        pm1, pm2 = self._make_linked_pair()
+        sid1 = pm1.connect('eio-1a', '/')
+        pm1.enter_room(sid1, '/', 'project')
+        pm1.enter_room(sid1, '/', 'on-duty')
+        sid2 = pm2.connect('eio-2a', '/')
+        pm2.enter_room(sid2, '/', 'project')
+        pm2.enter_room(sid2, '/', 'on-duty')
+        pm2.enter_room(sid2, '/', 'muted')
+        pm1.emit('foo', 'bar', namespace='/',
+                 room={'intersection': ['project', 'on-duty'],
+                       'exclude': 'muted'})
+        assert pm1.server._send_eio_packet.call_count == 1
+        assert pm1.server._send_eio_packet.call_args_list[0][0][0] == 'eio-1a'
+        # the remote client is in the muted room, so it is excluded
+        assert pm2.server._send_eio_packet.call_count == 0
+
+    def test_emit_selector_empty_intersection_across_hosts(self):
+        pm1, pm2 = self._make_linked_pair()
+        sid1 = pm1.connect('eio-1a', '/')
+        pm1.enter_room(sid1, '/', 'project')
+        sid2 = pm2.connect('eio-2a', '/')
+        pm2.enter_room(sid2, '/', 'on-duty')
+        pm1.emit('foo', 'bar', namespace='/',
+                 room={'intersection': ['project', 'on-duty']})
+        assert pm1.server._send_eio_packet.call_count == 0
+        assert pm2.server._send_eio_packet.call_count == 0
+
+    def test_emit_selector_leave_room_during_send_across_hosts(self):
+        pm1, pm2 = self._make_linked_pair()
+        sid1 = pm1.connect('eio-1a', '/')
+        pm1.enter_room(sid1, '/', 'project')
+        sid2 = pm2.connect('eio-2a', '/')
+        pm2.enter_room(sid2, '/', 'project')
+        sid3 = pm2.connect('eio-2b', '/')
+        pm2.enter_room(sid3, '/', 'project')
+
+        def send_and_leave(*args, **kwargs):
+            # a client leaves the room on the remote host while the emit
+            # is in progress
+            pm2.leave_room(sid3, '/', 'project')
+
+        pm2.server._send_eio_packet = mock.MagicMock(
+            side_effect=send_and_leave)
+        pm1.emit('foo', 'bar', namespace='/', room={'union': 'project'})
+        assert pm1.server._send_eio_packet.call_count == 1
+        # the remote host resolves its recipients before sending, so the
+        # client that left during the send still receives this event
+        assert pm2.server._send_eio_packet.call_count == 2
+        eio_sids = [c[0][0] for c in
+                    pm2.server._send_eio_packet.call_args_list]
+        assert sorted(eio_sids) == ['eio-2a', 'eio-2b']
+
+    def test_emit_selector_binary_across_hosts(self):
+        pm1, pm2 = self._make_linked_pair()
+        sid1 = pm1.connect('eio-1a', '/')
+        pm1.enter_room(sid1, '/', 'project')
+        sid2 = pm2.connect('eio-2a', '/')
+        pm2.enter_room(sid2, '/', 'project')
+        pm1.emit('foo', b'bar', namespace='/', room={'union': 'project'})
+        for pm, eio_sid in [(pm1, 'eio-1a'), (pm2, 'eio-2a')]:
+            assert pm.server._send_eio_packet.call_count == 2
+            calls = pm.server._send_eio_packet.call_args_list
+            assert calls[0][0][0] == eio_sid
+            assert calls[0][0][1].encode() == \
+                '451-["foo",{"_placeholder":true,"num":0}]'
+            assert calls[1][0][0] == eio_sid
+            assert calls[1][0][1].encode() == b'bar'

@@ -1,5 +1,7 @@
 from unittest import mock
 
+import pytest
+
 from socketio import async_manager
 from socketio import packet
 
@@ -380,3 +382,88 @@ class TestAsyncManager:
             == '123'
         pkt = self.bm.server._send_eio_packet.await_args_list[1][0][1]
         assert pkt.encode() == b'my binary data'
+
+    async def test_emit_to_room_selector_union(self):
+        sid1 = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = await self.bm.connect('456', '/foo')
+        await self.bm.enter_room(sid2, '/foo', 'bar')
+        await self.bm.enter_room(sid2, '/foo', 'baz')
+        sid3 = await self.bm.connect('789', '/foo')
+        await self.bm.enter_room(sid3, '/foo', 'baz')
+        await self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                           room={'union': ['bar', 'baz']})
+        # sid2 is in both rooms, but must receive the event only once
+        assert self.bm.server._send_eio_packet.await_count == 3
+        eio_sids = [c[0][0] for c in
+                    self.bm.server._send_eio_packet.await_args_list]
+        assert sorted(eio_sids) == ['123', '456', '789']
+
+    async def test_emit_to_room_selector_intersection_exclude(self):
+        sid1 = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid1, '/foo', 'project')
+        await self.bm.enter_room(sid1, '/foo', 'on-duty')
+        sid2 = await self.bm.connect('456', '/foo')
+        await self.bm.enter_room(sid2, '/foo', 'project')
+        await self.bm.enter_room(sid2, '/foo', 'on-duty')
+        await self.bm.enter_room(sid2, '/foo', 'muted')
+        sid3 = await self.bm.connect('789', '/foo')
+        await self.bm.enter_room(sid3, '/foo', 'project')
+        await self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                           room={'intersection': ['project', 'on-duty'],
+                                 'exclude': 'muted'})
+        assert self.bm.server._send_eio_packet.await_count == 1
+        assert self.bm.server._send_eio_packet.await_args_list[0][0][0] \
+            == '123'
+
+    async def test_emit_to_room_selector_empty_intersection(self):
+        sid1 = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = await self.bm.connect('456', '/foo')
+        await self.bm.enter_room(sid2, '/foo', 'baz')
+        await self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                           room={'intersection': ['bar', 'baz']})
+        assert self.bm.server._send_eio_packet.await_count == 0
+
+    async def test_emit_to_room_selector_leave_room_during_send(self):
+        sid1 = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid1, '/foo', 'bar')
+        await self.bm.enter_room(sid1, '/foo', 'baz')
+        sid2 = await self.bm.connect('456', '/foo')
+        await self.bm.enter_room(sid2, '/foo', 'bar')
+        await self.bm.enter_room(sid2, '/foo', 'baz')
+
+        async def send_and_leave(*args, **kwargs):
+            # a client leaves the rooms while the emit is in progress
+            await self.bm.leave_room(sid2, '/foo', 'bar')
+            await self.bm.leave_room(sid2, '/foo', 'baz')
+
+        self.bm.server._send_eio_packet = mock.AsyncMock(
+            side_effect=send_and_leave)
+        await self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                           room={'intersection': ['bar', 'baz']})
+        # the recipients are resolved before the send starts, so the client
+        # that left during the send still receives this event
+        assert self.bm.server._send_eio_packet.await_count == 2
+        eio_sids = [c[0][0] for c in
+                    self.bm.server._send_eio_packet.await_args_list]
+        assert sorted(eio_sids) == ['123', '456']
+
+    async def test_emit_to_invalid_room_selector(self):
+        sid = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid, '/foo', 'bar')
+        bad_selectors = [
+            {},                              # empty selector
+            {'exclude': ['bar']},            # nothing to include
+            {'union': []},                   # empty union
+            {'intersection': []},            # empty intersection
+            {'union': ['bar'], 'foo': []},   # unknown key
+            {'union': [123]},                # non-string room
+            {'union': 123},                  # not a room or list of rooms
+        ]
+        for selector in bad_selectors:
+            with pytest.raises(ValueError):
+                await self.bm.emit('my event', {'foo': 'bar'},
+                                   namespace='/foo', room=selector)
+        # nothing was sent for the invalid selectors
+        assert self.bm.server._send_eio_packet.await_count == 0

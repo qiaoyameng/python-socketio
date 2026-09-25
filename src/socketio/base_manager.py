@@ -7,6 +7,57 @@ from bidict import bidict, ValueDuplicationError
 default_logger = logging.getLogger('socketio')
 
 
+def _room_list(value, selector_key):
+    """Normalize a room selector value to a list of room names."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    try:
+        rooms = list(value)
+    except TypeError:
+        raise ValueError(
+            'invalid room list in "{}" selector'.format(selector_key))
+    for room in rooms:
+        if not isinstance(room, str):
+            raise ValueError('room names must be strings')
+    return rooms
+
+
+def _parse_room_selector(room):
+    """Validate a room specification and return it in normalized form.
+
+    The room specification can be ``None`` to address all the clients in a
+    namespace, a single room name, a list of room names (interpreted as a
+    union), or a dictionary with any of the ``union``, ``intersection`` and
+    ``exclude`` keys, each set to a room name or a list of room names.
+
+    Returns a ``(union, intersection, exclude)`` tuple of room lists. The
+    final set of recipients is the union of the ``union`` rooms plus the
+    intersection of the ``intersection`` rooms, minus the members of the
+    ``exclude`` rooms.
+    """
+    if room is None:
+        return [None], [], []
+    if isinstance(room, dict):
+        unknown_keys = set(room) - {'union', 'intersection', 'exclude'}
+        if unknown_keys:
+            raise ValueError('invalid room selector keys: {}'.format(
+                ', '.join(sorted(unknown_keys))))
+        union = _room_list(room.get('union'), 'union')
+        intersection = _room_list(room.get('intersection'), 'intersection')
+        exclude = _room_list(room.get('exclude'), 'exclude')
+        if not union and not intersection:
+            raise ValueError('room selector must include a "union" and/or '
+                             '"intersection" of rooms')
+        return union, intersection, exclude
+    if isinstance(room, str):
+        return [room], [], []
+    if hasattr(room, '__len__'):
+        return list(room), [], []
+    return [room], [], []
+
+
 class BaseManager:
     def __init__(self):
         self.logger = None
@@ -40,12 +91,22 @@ class BaseManager:
         across multiple servers.
         """
         ns = self.rooms.get(namespace, {})
-        if hasattr(room, '__len__') and not isinstance(room, str):
-            participants = ns[room[0]]._fwdm.copy() if room[0] in ns else {}
-            for r in room[1:]:
-                participants.update(ns[r]._fwdm if r in ns else {})
-        else:
-            participants = ns[room]._fwdm.copy() if room in ns else {}
+        union, intersection, exclude = _parse_room_selector(room)
+        participants = {}
+        for r in union:
+            if r in ns:
+                participants.update(ns[r]._fwdm)
+        if intersection:
+            common = None
+            for r in intersection:
+                members = set(ns[r]._fwdm) if r in ns else set()
+                common = members if common is None else common & members
+            for sid in common:
+                participants[sid] = ns[intersection[0]][sid]
+        for r in exclude:
+            if r in ns:
+                for sid in ns[r]._fwdm:
+                    participants.pop(sid, None)
         yield from participants.items()
 
     def connect(self, eio_sid, namespace):

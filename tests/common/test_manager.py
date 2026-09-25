@@ -360,3 +360,148 @@ class TestBaseManager:
         assert self.bm.server._send_eio_packet.call_args_list[1][0][0] == '123'
         pkt = self.bm.server._send_eio_packet.call_args_list[1][0][1]
         assert pkt.encode() == b'my binary data'
+
+    def test_emit_to_room_selector_union(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'bar')
+        self.bm.enter_room(sid2, '/foo', 'baz')
+        sid3 = self.bm.connect('789', '/foo')
+        self.bm.enter_room(sid3, '/foo', 'baz')
+        self.bm.connect('abc', '/foo')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                     room={'union': ['bar', 'baz']})
+        # sid2 is in both rooms, but must receive the event only once
+        assert self.bm.server._send_eio_packet.call_count == 3
+        eio_sids = [c[0][0] for c in
+                    self.bm.server._send_eio_packet.call_args_list]
+        assert sorted(eio_sids) == ['123', '456', '789']
+
+    def test_emit_to_room_selector_intersection(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'bar')
+        self.bm.enter_room(sid2, '/foo', 'baz')
+        sid3 = self.bm.connect('789', '/foo')
+        self.bm.enter_room(sid3, '/foo', 'baz')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                     room={'intersection': ['bar', 'baz']})
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '456'
+        pkt = self.bm.server._send_eio_packet.call_args_list[0][0][1]
+        assert pkt.encode() == '42/foo,["my event",{"foo":"bar"}]'
+
+    def test_emit_to_room_selector_intersection_exclude(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'project')
+        self.bm.enter_room(sid1, '/foo', 'on-duty')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'project')
+        self.bm.enter_room(sid2, '/foo', 'on-duty')
+        self.bm.enter_room(sid2, '/foo', 'muted')
+        sid3 = self.bm.connect('789', '/foo')
+        self.bm.enter_room(sid3, '/foo', 'project')
+        sid4 = self.bm.connect('abc', '/foo')
+        self.bm.enter_room(sid4, '/foo', 'on-duty')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                     room={'intersection': ['project', 'on-duty'],
+                           'exclude': 'muted'})
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '123'
+
+    def test_emit_to_room_selector_union_exclude(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'bar')
+        self.bm.enter_room(sid2, '/foo', 'baz')
+        sid3 = self.bm.connect('789', '/foo')
+        self.bm.enter_room(sid3, '/foo', 'baz')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                     room={'union': 'bar', 'exclude': ['baz']})
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '123'
+
+    def test_emit_to_room_selector_empty_intersection(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'baz')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                     room={'intersection': ['bar', 'baz']})
+        assert self.bm.server._send_eio_packet.call_count == 0
+        # intersection with a room that does not exist is also empty
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                     room={'intersection': ['bar', 'no-such-room']})
+        assert self.bm.server._send_eio_packet.call_count == 0
+
+    def test_emit_to_room_selector_skip_sid(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        self.bm.enter_room(sid1, '/foo', 'baz')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'bar')
+        self.bm.enter_room(sid2, '/foo', 'baz')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                     room={'intersection': ['bar', 'baz']}, skip_sid=sid2)
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '123'
+
+    def test_emit_to_room_selector_leave_room_during_send(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        self.bm.enter_room(sid1, '/foo', 'baz')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'bar')
+        self.bm.enter_room(sid2, '/foo', 'baz')
+
+        original_send = self.bm.server._send_eio_packet
+
+        def send_and_leave(*args, **kwargs):
+            # a client leaves the rooms while the emit is in progress
+            self.bm.leave_room(sid2, '/foo', 'bar')
+            self.bm.leave_room(sid2, '/foo', 'baz')
+
+        self.bm.server._send_eio_packet = mock.MagicMock(
+            side_effect=send_and_leave)
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                     room={'intersection': ['bar', 'baz']})
+        # the recipients are resolved before the send starts, so the client
+        # that left during the send still receives this event
+        assert self.bm.server._send_eio_packet.call_count == 2
+        eio_sids = [c[0][0] for c in
+                    self.bm.server._send_eio_packet.call_args_list]
+        assert sorted(eio_sids) == ['123', '456']
+        self.bm.server._send_eio_packet = original_send
+
+    def test_emit_to_room_selector_binary(self):
+        sid = self.bm.connect('123', '/')
+        self.bm.enter_room(sid, '/', 'bar')
+        self.bm.emit('my event', b'my binary data', namespace='/',
+                     room={'union': 'bar'})
+        assert self.bm.server._send_eio_packet.call_count == 2
+        pkt = self.bm.server._send_eio_packet.call_args_list[0][0][1]
+        assert pkt.encode() == '451-["my event",{"_placeholder":true,"num":0}]'
+        pkt = self.bm.server._send_eio_packet.call_args_list[1][0][1]
+        assert pkt.encode() == b'my binary data'
+
+    def test_emit_to_invalid_room_selector(self):
+        sid = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid, '/foo', 'bar')
+        bad_selectors = [
+            {},                              # empty selector
+            {'exclude': ['bar']},            # nothing to include
+            {'union': []},                   # empty union
+            {'intersection': []},            # empty intersection
+            {'union': ['bar'], 'foo': []},   # unknown key
+            {'union': [123]},                # non-string room
+            {'union': 123},                  # not a room or list of rooms
+        ]
+        for selector in bad_selectors:
+            with pytest.raises(ValueError):
+                self.bm.emit('my event', {'foo': 'bar'}, namespace='/foo',
+                             room=selector)
+        # nothing was sent for the invalid selectors
+        assert self.bm.server._send_eio_packet.call_count == 0

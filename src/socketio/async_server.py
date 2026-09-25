@@ -143,8 +143,11 @@ class AsyncServer(base_server.BaseServer):
                    session ID of a client to address only that client, to any
                    any custom room created by the application to address all
                    the clients in that room, or to a list of custom room
-                   names. If this argument is omitted the event is broadcasted
-                   to all connected clients.
+                   names. A dictionary with any of the ``union``,
+                   ``intersection`` and ``exclude`` keys, each set to a room
+                   name or a list of room names, can be used to address a
+                   combination of rooms. If this argument is omitted the
+                   event is broadcasted to all connected clients.
         :param room: Alias for the ``to`` parameter.
         :param skip_sid: The session ID of a client to skip when broadcasting
                          to a room or to all clients. This can be used to
@@ -196,8 +199,11 @@ class AsyncServer(base_server.BaseServer):
                    session ID of a client to address only that client, to any
                    any custom room created by the application to address all
                    the clients in that room, or to a list of custom room
-                   names. If this argument is omitted the event is broadcasted
-                   to all connected clients.
+                   names. A dictionary with any of the ``union``,
+                   ``intersection`` and ``exclude`` keys, each set to a room
+                   name or a list of room names, can be used to address a
+                   combination of rooms. If this argument is omitted the
+                   event is broadcasted to all connected clients.
         :param room: Alias for the ``to`` parameter.
         :param skip_sid: The session ID of a client to skip when broadcasting
                          to a room or to all clients. This can be used to

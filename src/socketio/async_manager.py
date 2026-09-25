@@ -3,7 +3,7 @@ import inspect
 
 from engineio import packet as eio_packet
 from socketio import packet
-from .base_manager import BaseManager
+from .base_manager import BaseManager, _parse_room_selector
 
 
 class AsyncManager(BaseManager):
@@ -19,6 +19,7 @@ class AsyncManager(BaseManager):
         Note: this method is a coroutine.
         """
         room = to or room
+        _parse_room_selector(room)  # validate before sending
         if namespace not in self.rooms:
             return
         if isinstance(data, tuple):

@@ -2,6 +2,7 @@ import base64
 from functools import partial
 import uuid
 
+from . import base_manager
 from .manager import Manager
 from .packet import Packet
 
@@ -62,6 +63,9 @@ class PubSubManager(Manager):
         The parameters are the same as in :meth:`.Server.emit`.
         """
         room = to or room
+        # validate the room selector before anything is sent or published,
+        # so that invalid combinations are rejected on the sender
+        base_manager._parse_room_selector(room)
         if kwargs.get('ignore_queue'):
             return super().emit(
                 event, data, namespace=namespace, room=room, skip_sid=skip_sid,
@@ -73,6 +77,9 @@ class PubSubManager(Manager):
                                    'context of a server.')
             if room is None:
                 raise ValueError('Cannot use callback without a room set.')
+            if not isinstance(room, str):
+                raise ValueError('Callbacks can only be used when addressing '
+                                 'a single room or client.')
             id = self._generate_ack_id(room, callback)
             callback = (room, namespace, id)
         else:

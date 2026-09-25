@@ -4,6 +4,7 @@ from functools import partial
 import uuid
 
 from .async_manager import AsyncManager
+from .base_manager import _parse_room_selector
 from .packet import Packet
 
 
@@ -65,6 +66,9 @@ class AsyncPubSubManager(AsyncManager):
         Note: this method is a coroutine.
         """
         room = to or room
+        # validate the room selector before anything is sent or published,
+        # so that invalid combinations are rejected on the sender
+        _parse_room_selector(room)
         if kwargs.get('ignore_queue'):
             return await super().emit(
                 event, data, namespace=namespace, room=room, skip_sid=skip_sid,
@@ -76,6 +80,9 @@ class AsyncPubSubManager(AsyncManager):
                                    'context of a server.')
             if room is None:
                 raise ValueError('Cannot use callback without a room set.')
+            if not isinstance(room, str):
+                raise ValueError('Callbacks can only be used when addressing '
+                                 'a single room or client.')
             id = self._generate_ack_id(room, callback)
             callback = (room, namespace, id)
         else:

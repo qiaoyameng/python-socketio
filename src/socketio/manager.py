@@ -24,6 +24,7 @@ class Manager(base_manager.BaseManager):
         """Emit a message to a single client, a room, or all the clients
         connected to the namespace."""
         room = to or room
+        base_manager._parse_room_selector(room)  # validate before sending
         if namespace not in self.rooms:
             return
         if isinstance(data, tuple):
