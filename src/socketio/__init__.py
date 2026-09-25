@@ -1,5 +1,6 @@
 from .client import Client
 from .simple_client import SimpleClient
+from .base_manager import RoomSelection
 from .manager import Manager
 from .pubsub_manager import PubSubManager
 from .kombu_manager import KombuManager
@@ -19,10 +20,10 @@ from .async_redis_manager import AsyncRedisManager
 from .async_aiopika_manager import AsyncAioPikaManager
 from .asgi import ASGIApp
 
-__all__ = ['SimpleClient', 'Client', 'Server', 'Manager', 'PubSubManager',
-           'KombuManager', 'RedisManager', 'ZmqManager', 'KafkaManager',
-           'Namespace', 'ClientNamespace', 'WSGIApp', 'Middleware',
-           'AsyncSimpleClient', 'AsyncClient', 'AsyncServer',
+__all__ = ['SimpleClient', 'Client', 'Server', 'Manager', 'RoomSelection',
+           'PubSubManager', 'KombuManager', 'RedisManager', 'ZmqManager',
+           'KafkaManager', 'Namespace', 'ClientNamespace', 'WSGIApp',
+           'Middleware', 'AsyncSimpleClient', 'AsyncClient', 'AsyncServer',
            'AsyncNamespace', 'AsyncClientNamespace', 'AsyncManager',
            'AsyncRedisManager', 'ASGIApp', 'get_tornado_handler',
            'AsyncAioPikaManager']

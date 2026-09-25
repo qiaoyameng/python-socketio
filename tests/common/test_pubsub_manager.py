@@ -6,6 +6,7 @@ from unittest import mock
 import pytest
 
 from engineio.packet import Packet as EIOPacket
+from socketio import base_manager
 from socketio import manager
 from socketio import pubsub_manager
 from socketio import packet
@@ -835,3 +836,149 @@ class TestPubSubManager:
 
         packet.Packet.json = saved_json
         EIOPacket.json = saved_json
+
+
+class FakeChannel:
+    """A fake pub/sub channel that connects any number of managers.
+
+    Messages are serialized and deserialized with JSON to simulate what a
+    real pub/sub backend would do with them.
+    """
+    def __init__(self):
+        self.managers = []
+        self.messages = []
+
+    def attach(self, pm):
+        self.managers.append(pm)
+        pm._publish = functools.partial(self.publish, pm)
+
+    def publish(self, sender, message):
+        message = json.loads(json.dumps(message))
+        self.messages.append(message)
+        for pm in self.managers:
+            if pm is not sender:
+                if message['method'] == 'emit':
+                    pm._handle_emit(message)
+
+
+class TestPubSubRoomSelection:
+    def setup_method(self):
+        def make_manager(prefix):
+            id = 0
+
+            def generate_id():
+                nonlocal id
+                id += 1
+                return '{}{}'.format(prefix, id)
+
+            mock_server = mock.MagicMock()
+            mock_server.eio.generate_id = generate_id
+            mock_server.packet_class = packet.Packet
+            pm = pubsub_manager.PubSubManager()
+            pm.set_server(mock_server)
+            pm.initialize()
+            return pm
+
+        self.channel = FakeChannel()
+        self.pm1 = make_manager('a')
+        self.pm2 = make_manager('b')
+        self.channel.attach(self.pm1)
+        self.channel.attach(self.pm2)
+
+    def connect(self, pm, eio_sid, rooms=()):
+        sid = pm.connect(eio_sid, '/')
+        for room in rooms:
+            pm.enter_room(sid, '/', room)
+        return sid
+
+    def test_selection_cross_node_overlap(self):
+        # node 1: a1 is in project and on duty, a2 only in project
+        self.connect(self.pm1, 'eio-a1', ['project', 'on-duty'])
+        self.connect(self.pm1, 'eio-a2', ['project'])
+        # node 2: b1 is also muted, b2 is in project and on duty
+        self.connect(self.pm2, 'eio-b1', ['project', 'on-duty', 'muted'])
+        self.connect(self.pm2, 'eio-b2', ['project', 'on-duty'])
+
+        self.pm1.emit('notice', 'hello',
+                      to=base_manager.RoomSelection(union='project',
+                                                    intersect='on-duty',
+                                                    exclude='muted'))
+
+        # the selection criteria, and not a list of sids, must have been
+        # sent through the channel
+        assert self.channel.messages[0]['room'] == {
+            'union': ['project'], 'intersect': ['on-duty'],
+            'exclude': ['muted']}
+
+        # each node delivers to its own clients only, once per client
+        assert self.pm1.server._send_eio_packet.call_count == 1
+        assert self.pm1.server._send_eio_packet.call_args_list[0][0][0] == \
+            'eio-a1'
+        assert self.pm2.server._send_eio_packet.call_count == 1
+        assert self.pm2.server._send_eio_packet.call_args_list[0][0][0] == \
+            'eio-b2'
+        pkt = self.pm2.server._send_eio_packet.call_args_list[0][0][1]
+        assert pkt.encode() == '42["notice","hello"]'
+
+    def test_selection_empty_intersection(self):
+        self.connect(self.pm1, 'eio-a1', ['project'])
+        self.connect(self.pm2, 'eio-b1', ['on-duty'])
+
+        self.pm1.emit('notice', 'hello',
+                      to=base_manager.RoomSelection(
+                          intersect=['project', 'on-duty']))
+
+        assert self.pm1.server._send_eio_packet.call_count == 0
+        assert self.pm2.server._send_eio_packet.call_count == 0
+
+    def test_selection_leave_room_during_send(self):
+        self.connect(self.pm1, 'eio-a1', ['project'])
+        sid_b1 = self.connect(self.pm2, 'eio-b1', ['project'])
+        self.connect(self.pm2, 'eio-b2', ['project'])
+
+        def leave_room(eio_sid, pkt):
+            # a client leaving the room on the remote node while the event
+            # is being sent must not break the delivery
+            self.pm2.leave_room(sid_b1, '/', 'project')
+
+        self.pm2.server._send_eio_packet.side_effect = leave_room
+        self.pm1.emit('notice', 'hello',
+                      to=base_manager.RoomSelection(union='project'))
+
+        assert self.pm1.server._send_eio_packet.call_count == 1
+        assert self.pm2.server._send_eio_packet.call_count == 2
+        recipients = [c[0][0] for c in
+                      self.pm2.server._send_eio_packet.call_args_list]
+        assert recipients == ['eio-b1', 'eio-b2']
+
+    def test_selection_binary_event(self):
+        self.connect(self.pm1, 'eio-a1', ['project'])
+        self.connect(self.pm2, 'eio-b1', ['project'])
+
+        self.pm1.emit('notice', b'\x00\x01',
+                      to=base_manager.RoomSelection(union='project'))
+
+        assert self.channel.messages[0]['binary'] is True
+        for pm in [self.pm1, self.pm2]:
+            assert pm.server._send_eio_packet.call_count == 2
+            pkt = pm.server._send_eio_packet.call_args_list[0][0][1]
+            assert pkt.encode() == \
+                '451-["notice",{"_placeholder":true,"num":0}]'
+            pkt = pm.server._send_eio_packet.call_args_list[1][0][1]
+            assert pkt.encode() == b'\x00\x01'
+
+    def test_selection_with_callback_rejected(self):
+        self.connect(self.pm1, 'eio-a1', ['project'])
+        with pytest.raises(ValueError):
+            self.pm1.emit('notice', 'hello',
+                          to=base_manager.RoomSelection(union='project'),
+                          callback=lambda: None)
+        assert self.channel.messages == []
+        assert self.pm1.server._send_eio_packet.call_count == 0
+
+    def test_conflicting_to_and_room_rejected(self):
+        self.connect(self.pm1, 'eio-a1', ['project'])
+        with pytest.raises(ValueError):
+            self.pm1.emit('notice', 'hello', to='project', room='other')
+        assert self.channel.messages == []
+        assert self.pm1.server._send_eio_packet.call_count == 0

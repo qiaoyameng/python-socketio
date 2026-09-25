@@ -7,6 +7,104 @@ from bidict import bidict, ValueDuplicationError
 default_logger = logging.getLogger('socketio')
 
 
+class RoomSelection:
+    """A recipient selection based on set operations over rooms.
+
+    The selection is evaluated by the manager (or by each server in a
+    pub/sub deployment) against the clients of a single namespace, so the
+    application does not need to retrieve the full list of session IDs to
+    compute the recipients itself.
+
+    :param union: a room name or list of room names. Clients that are in at
+                  least one of these rooms are candidates for the selection.
+                  If omitted, all the clients connected to the namespace are
+                  candidates.
+    :param intersect: a room name or list of room names. Candidates are kept
+                      only if they are in all of these rooms.
+    :param exclude: a room name or list of room names. Clients that are in
+                    any of these rooms are removed from the selection.
+
+    At least one of the three arguments must be provided. Example usage to
+    reach clients that are in the ``'project'`` room and also on duty, but
+    not muted::
+
+        sio.emit('notification', data,
+                 to=socketio.RoomSelection(union='project',
+                                           intersect='on-duty',
+                                           exclude='muted'))
+    """
+    def __init__(self, union=None, intersect=None, exclude=None):
+        self.union = self._validate_rooms(union, 'union')
+        self.intersect = self._validate_rooms(intersect, 'intersect')
+        self.exclude = self._validate_rooms(exclude, 'exclude')
+        if self.union is None and self.intersect is None and \
+                self.exclude is None:
+            raise ValueError(
+                'RoomSelection requires at least one of "union", '
+                '"intersect" or "exclude".')
+
+    @staticmethod
+    def _validate_rooms(rooms, name):
+        if rooms is None:
+            return None
+        if isinstance(rooms, str):
+            rooms = [rooms]
+        elif isinstance(rooms, dict):
+            raise ValueError(
+                'RoomSelection "{}" must be a room name or a list of '
+                'room names.'.format(name))
+        else:
+            try:
+                rooms = list(rooms)
+            except TypeError:
+                raise ValueError(
+                    'RoomSelection "{}" must be a room name or a list of '
+                    'room names.'.format(name))
+        if len(rooms) == 0:
+            return None
+        for room in rooms:
+            if not isinstance(room, str):
+                raise ValueError(
+                    'RoomSelection "{}" entries must be room name '
+                    'strings.'.format(name))
+        return rooms
+
+    def to_dict(self):
+        """Return a JSON-serializable representation of this selection."""
+        return {
+            'union': self.union,
+            'intersect': self.intersect,
+            'exclude': self.exclude,
+        }
+
+    @classmethod
+    def from_dict(cls, selection):
+        """Rebuild a selection from its dictionary representation."""
+        return cls(union=selection.get('union'),
+                   intersect=selection.get('intersect'),
+                   exclude=selection.get('exclude'))
+
+    def __eq__(self, other):
+        return isinstance(other, RoomSelection) and \
+            self.to_dict() == other.to_dict()
+
+    def __repr__(self):
+        return 'RoomSelection(union={!r}, intersect={!r}, exclude={!r})' \
+            .format(self.union, self.intersect, self.exclude)
+
+
+def resolve_room(to=None, room=None):
+    """Combine the ``to`` and ``room`` arguments of an emit call.
+
+    Conflicting combinations are rejected before anything is sent.
+    """
+    if to is not None and room is not None and to != room:
+        raise ValueError(
+            'The "to" and "room" arguments cannot be used together with '
+            'different values.')
+    return to if to is not None else room
+
+
 class BaseManager:
     def __init__(self):
         self.logger = None
@@ -34,13 +132,46 @@ class BaseManager:
     def get_participants(self, namespace, room):
         """Return an iterable with the active participants in a room.
 
+        The room can be given as a single room name, a list of room names
+        (evaluated as a union) or a :class:`RoomSelection` instance, which
+        is evaluated as a combination of union, intersection and exclusion
+        operations over rooms. Each participant is returned at most once.
+
         Note that in a multi-server scenario this method only returns the
         participants connect to the server in which the method is called. There
         is currently no functionality to assemble a complete list of users
         across multiple servers.
         """
         ns = self.rooms.get(namespace, {})
-        if hasattr(room, '__len__') and not isinstance(room, str):
+        if isinstance(room, RoomSelection):
+            # the selection is evaluated here, so that each participant is
+            # returned only once, and so that the list of recipients is a
+            # snapshot that is not affected by room changes that occur
+            # while the event is being emitted
+            participants = {}
+            if room.union is not None:
+                for r in room.union:
+                    participants.update(ns.get(r, {}))
+            else:
+                participants.update(ns.get(None, {}))
+            if room.intersect is not None:
+                for r in room.intersect:
+                    members = ns.get(r, {})
+                    participants = {
+                        sid: eio_sid
+                        for sid, eio_sid in participants.items()
+                        if sid in members
+                    }
+            if room.exclude is not None:
+                excluded = set()
+                for r in room.exclude:
+                    excluded.update(ns.get(r, {}))
+                participants = {
+                    sid: eio_sid
+                    for sid, eio_sid in participants.items()
+                    if sid not in excluded
+                }
+        elif hasattr(room, '__len__') and not isinstance(room, str):
             participants = ns[room[0]]._fwdm.copy() if room[0] in ns else {}
             for r in room[1:]:
                 participants.update(ns[r]._fwdm if r in ns else {})

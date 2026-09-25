@@ -3,6 +3,7 @@ import base64
 from functools import partial
 import uuid
 
+from .base_manager import RoomSelection, resolve_room
 from .async_manager import AsyncManager
 from .packet import Packet
 
@@ -64,12 +65,19 @@ class AsyncPubSubManager(AsyncManager):
 
         Note: this method is a coroutine.
         """
-        room = to or room
+        room = resolve_room(to, room)
         if kwargs.get('ignore_queue'):
             return await super().emit(
                 event, data, namespace=namespace, room=room, skip_sid=skip_sid,
                 callback=callback)
         namespace = namespace or '/'
+        if isinstance(room, RoomSelection):
+            if callback is not None:
+                raise ValueError(
+                    'Cannot use a callback with a room selection.')
+            # the selection is sent to the other servers, so that each
+            # server can evaluate it against its own local clients
+            room = room.to_dict()
         if callback is not None:
             if self.server is None:
                 raise RuntimeError('Callbacks can only be issued from the '
@@ -178,9 +186,14 @@ class AsyncPubSubManager(AsyncManager):
                 data = data[0]
             else:
                 data = tuple(data)
+        room = message.get('room')
+        if isinstance(room, dict):
+            # the sender did not resolve the selection, so that it can be
+            # evaluated against the clients connected to this server
+            room = RoomSelection.from_dict(room)
         await super().emit(message['event'], data,
                            namespace=message.get('namespace'),
-                           room=message.get('room'),
+                           room=room,
                            skip_sid=message.get('skip_sid'),
                            callback=callback)
 

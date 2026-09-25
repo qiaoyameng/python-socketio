@@ -3,7 +3,7 @@ import inspect
 
 from engineio import packet as eio_packet
 from socketio import packet
-from .base_manager import BaseManager
+from .base_manager import BaseManager, resolve_room
 
 
 class AsyncManager(BaseManager):
@@ -18,7 +18,7 @@ class AsyncManager(BaseManager):
 
         Note: this method is a coroutine.
         """
-        room = to or room
+        room = resolve_room(to, room)
         if namespace not in self.rooms:
             return
         if isinstance(data, tuple):

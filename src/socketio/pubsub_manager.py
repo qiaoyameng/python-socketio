@@ -2,6 +2,7 @@ import base64
 from functools import partial
 import uuid
 
+from .base_manager import RoomSelection, resolve_room
 from .manager import Manager
 from .packet import Packet
 
@@ -61,12 +62,19 @@ class PubSubManager(Manager):
 
         The parameters are the same as in :meth:`.Server.emit`.
         """
-        room = to or room
+        room = resolve_room(to, room)
         if kwargs.get('ignore_queue'):
             return super().emit(
                 event, data, namespace=namespace, room=room, skip_sid=skip_sid,
                 callback=callback)
         namespace = namespace or '/'
+        if isinstance(room, RoomSelection):
+            if callback is not None:
+                raise ValueError(
+                    'Cannot use a callback with a room selection.')
+            # the selection is sent to the other servers, so that each
+            # server can evaluate it against its own local clients
+            room = room.to_dict()
         if callback is not None:
             if self.server is None:
                 raise RuntimeError('Callbacks can only be issued from the '
@@ -174,9 +182,14 @@ class PubSubManager(Manager):
                 data = data[0]
             else:
                 data = tuple(data)
+        room = message.get('room')
+        if isinstance(room, dict):
+            # the sender did not resolve the selection, so that it can be
+            # evaluated against the clients connected to this server
+            room = RoomSelection.from_dict(room)
         super().emit(message['event'], data,
                      namespace=message.get('namespace'),
-                     room=message.get('room'),
+                     room=room,
                      skip_sid=message.get('skip_sid'), callback=callback)
 
     def _handle_callback(self, message):

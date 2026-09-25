@@ -2,6 +2,7 @@ from unittest import mock
 
 import pytest
 
+from socketio import base_manager
 from socketio import manager
 from socketio import packet
 
@@ -358,5 +359,152 @@ class TestBaseManager:
         pkt = self.bm.server._send_eio_packet.call_args_list[0][0][1]
         assert pkt.encode() == '451-["my event",{"_placeholder":true,"num":0}]'
         assert self.bm.server._send_eio_packet.call_args_list[1][0][0] == '123'
+        pkt = self.bm.server._send_eio_packet.call_args_list[1][0][1]
+        assert pkt.encode() == b'my binary data'
+
+    def test_emit_conflicting_to_and_room(self):
+        self.bm.connect('123', '/foo')
+        with pytest.raises(ValueError):
+            self.bm.emit('my event', 'data', namespace='/foo', to='bar',
+                         room='baz')
+        assert self.bm.server._send_eio_packet.call_count == 0
+
+    def test_room_selection_invalid(self):
+        with pytest.raises(ValueError):
+            base_manager.RoomSelection()
+        with pytest.raises(ValueError):
+            base_manager.RoomSelection(union=[], intersect=[])
+        with pytest.raises(ValueError):
+            base_manager.RoomSelection(union=123)
+        with pytest.raises(ValueError):
+            base_manager.RoomSelection(intersect=['bar', 123])
+        with pytest.raises(ValueError):
+            base_manager.RoomSelection(exclude={'bar': 'baz'})
+
+    def test_room_selection_serialization(self):
+        selection = base_manager.RoomSelection(
+            union='project', intersect=['on-duty'], exclude=['muted'])
+        assert selection.union == ['project']
+        assert selection.intersect == ['on-duty']
+        assert selection.exclude == ['muted']
+        d = selection.to_dict()
+        assert d == {'union': ['project'], 'intersect': ['on-duty'],
+                     'exclude': ['muted']}
+        assert base_manager.RoomSelection.from_dict(d) == selection
+        assert base_manager.RoomSelection.from_dict(d) != \
+            base_manager.RoomSelection(union='project')
+
+    def test_emit_to_room_selection_union(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'bar')
+        self.bm.enter_room(sid2, '/foo', 'baz')
+        sid3 = self.bm.connect('789', '/foo')
+        self.bm.enter_room(sid3, '/foo', 'baz')
+        self.bm.connect('abc', '/foo')
+        self.bm.emit('my event', 'data', namespace='/foo',
+                     to=base_manager.RoomSelection(union=['bar', 'baz']))
+        # sid2 is in both rooms, but must receive the event only once
+        assert self.bm.server._send_eio_packet.call_count == 3
+        recipients = [c[0][0] for c in
+                      self.bm.server._send_eio_packet.call_args_list]
+        assert recipients == ['123', '456', '789']
+
+    def test_emit_to_room_selection_intersect(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'project')
+        self.bm.enter_room(sid1, '/foo', 'on-duty')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'project')
+        sid3 = self.bm.connect('789', '/foo')
+        self.bm.enter_room(sid3, '/foo', 'on-duty')
+        self.bm.emit('my event', 'data', namespace='/foo',
+                     to=base_manager.RoomSelection(
+                         intersect=['project', 'on-duty']))
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '123'
+
+    def test_emit_to_room_selection_exclude(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'muted')
+        self.bm.connect('456', '/foo')
+        self.bm.connect('789', '/bar')
+        self.bm.emit('my event', 'data', namespace='/foo',
+                     to=base_manager.RoomSelection(exclude='muted'))
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '456'
+
+    def test_emit_to_room_selection_combined(self):
+        # clients in the project room that are also on duty, but not muted
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'project')
+        self.bm.enter_room(sid1, '/foo', 'on-duty')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'project')
+        self.bm.enter_room(sid2, '/foo', 'on-duty')
+        self.bm.enter_room(sid2, '/foo', 'muted')
+        sid3 = self.bm.connect('789', '/foo')
+        self.bm.enter_room(sid3, '/foo', 'project')
+        sid4 = self.bm.connect('abc', '/foo')
+        self.bm.enter_room(sid4, '/foo', 'on-duty')
+        self.bm.emit('my event', 'data', namespace='/foo',
+                     to=base_manager.RoomSelection(
+                         union='project', intersect='on-duty',
+                         exclude='muted'))
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '123'
+        pkt = self.bm.server._send_eio_packet.call_args_list[0][0][1]
+        assert pkt.encode() == '42/foo,["my event","data"]'
+
+    def test_emit_to_room_selection_empty_intersection(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'project')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'on-duty')
+        self.bm.emit('my event', 'data', namespace='/foo',
+                     to=base_manager.RoomSelection(
+                         intersect=['project', 'on-duty']))
+        assert self.bm.server._send_eio_packet.call_count == 0
+
+    def test_emit_to_room_selection_with_skip_sid(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'project')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'project')
+        self.bm.emit('my event', 'data', namespace='/foo',
+                     to=base_manager.RoomSelection(union='project'),
+                     skip_sid=sid1)
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '456'
+
+    def test_emit_to_room_selection_leave_room_during_send(self):
+        sid1 = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid1, '/foo', 'project')
+        sid2 = self.bm.connect('456', '/foo')
+        self.bm.enter_room(sid2, '/foo', 'project')
+
+        def leave_room(eio_sid, pkt):
+            # a client leaving the room while the event is being sent must
+            # not affect the delivery to the remaining recipients
+            self.bm.leave_room(sid2, '/foo', 'project')
+
+        self.bm.server._send_eio_packet.side_effect = leave_room
+        self.bm.emit('my event', 'data', namespace='/foo',
+                     to=base_manager.RoomSelection(union='project'))
+        assert self.bm.server._send_eio_packet.call_count == 2
+        recipients = [c[0][0] for c in
+                      self.bm.server._send_eio_packet.call_args_list]
+        assert recipients == ['123', '456']
+
+    def test_emit_to_room_selection_binary(self):
+        sid = self.bm.connect('123', '/foo')
+        self.bm.enter_room(sid, '/foo', 'project')
+        self.bm.emit('my event', b'my binary data', namespace='/foo',
+                     to=base_manager.RoomSelection(union='project'))
+        assert self.bm.server._send_eio_packet.call_count == 2
+        pkt = self.bm.server._send_eio_packet.call_args_list[0][0][1]
+        assert pkt.encode() == \
+            '451-/foo,["my event",{"_placeholder":true,"num":0}]'
         pkt = self.bm.server._send_eio_packet.call_args_list[1][0][1]
         assert pkt.encode() == b'my binary data'

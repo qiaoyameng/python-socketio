@@ -1,5 +1,8 @@
 from unittest import mock
 
+import pytest
+
+from socketio import base_manager
 from socketio import async_manager
 from socketio import packet
 
@@ -378,5 +381,55 @@ class TestAsyncManager:
         assert pkt.encode() == '451-["my event",{"_placeholder":true,"num":0}]'
         assert self.bm.server._send_eio_packet.await_args_list[1][0][0] \
             == '123'
+        pkt = self.bm.server._send_eio_packet.await_args_list[1][0][1]
+        assert pkt.encode() == b'my binary data'
+
+    async def test_emit_conflicting_to_and_room(self):
+        await self.bm.connect('123', '/foo')
+        with pytest.raises(ValueError):
+            await self.bm.emit('my event', 'data', namespace='/foo',
+                               to='bar', room='baz')
+        assert self.bm.server._send_eio_packet.await_count == 0
+
+    async def test_emit_to_room_selection_combined(self):
+        # clients in the project room that are also on duty, but not muted
+        sid1 = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid1, '/foo', 'project')
+        await self.bm.enter_room(sid1, '/foo', 'on-duty')
+        sid2 = await self.bm.connect('456', '/foo')
+        await self.bm.enter_room(sid2, '/foo', 'project')
+        await self.bm.enter_room(sid2, '/foo', 'on-duty')
+        await self.bm.enter_room(sid2, '/foo', 'muted')
+        sid3 = await self.bm.connect('789', '/foo')
+        await self.bm.enter_room(sid3, '/foo', 'project')
+        await self.bm.emit('my event', 'data', namespace='/foo',
+                           to=base_manager.RoomSelection(
+                               union='project', intersect='on-duty',
+                               exclude='muted'))
+        assert self.bm.server._send_eio_packet.await_count == 1
+        assert self.bm.server._send_eio_packet.await_args_list[0][0][0] \
+            == '123'
+
+    async def test_emit_to_room_selection_union_once(self):
+        sid1 = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid1, '/foo', 'bar')
+        sid2 = await self.bm.connect('456', '/foo')
+        await self.bm.enter_room(sid2, '/foo', 'bar')
+        await self.bm.enter_room(sid2, '/foo', 'baz')
+        await self.bm.emit('my event', 'data', namespace='/foo',
+                           to=base_manager.RoomSelection(union=['bar',
+                                                                'baz']))
+        # sid2 is in both rooms, but must receive the event only once
+        assert self.bm.server._send_eio_packet.await_count == 2
+        recipients = [c[0][0] for c in
+                      self.bm.server._send_eio_packet.await_args_list]
+        assert recipients == ['123', '456']
+
+    async def test_emit_to_room_selection_binary(self):
+        sid = await self.bm.connect('123', '/foo')
+        await self.bm.enter_room(sid, '/foo', 'project')
+        await self.bm.emit('my event', b'my binary data', namespace='/foo',
+                           to=base_manager.RoomSelection(union='project'))
+        assert self.bm.server._send_eio_packet.await_count == 2
         pkt = self.bm.server._send_eio_packet.await_args_list[1][0][1]
         assert pkt.encode() == b'my binary data'

@@ -2,6 +2,7 @@ import logging
 
 import engineio
 
+from . import base_manager
 from . import base_server
 from . import exceptions
 from . import packet
@@ -130,9 +131,11 @@ class Server(base_server.BaseServer):
         :param to: The recipient of the message. This can be set to the
                    session ID of a client to address only that client, to any
                    custom room created by the application to address all
-                   the clients in that room, or to a list of custom room
-                   names. If this argument is omitted the event is broadcasted
-                   to all connected clients.
+                   the clients in that room, to a list of custom room
+                   names, or to a :class:`socketio.RoomSelection` instance
+                   to address the combination of rooms defined by union,
+                   intersection and exclusion operations. If this argument is
+                   omitted the event is broadcasted to all connected clients.
         :param room: Alias for the ``to`` parameter.
         :param skip_sid: The session ID of a client to skip when broadcasting
                          to a room or to all clients. This can be used to
@@ -161,7 +164,7 @@ class Server(base_server.BaseServer):
         situation.
         """
         namespace = namespace or '/'
-        room = to or room
+        room = base_manager.resolve_room(to, room)
         self.logger.info('emitting event "%s" to %s [%s]', event,
                          room or 'all', namespace)
         self.manager.emit(event, data, namespace, room=room,

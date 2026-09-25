@@ -23,7 +23,7 @@ class Manager(base_manager.BaseManager):
              callback=None, to=None, **kwargs):
         """Emit a message to a single client, a room, or all the clients
         connected to the namespace."""
-        room = to or room
+        room = base_manager.resolve_room(to, room)
         if namespace not in self.rooms:
             return
         if isinstance(data, tuple):
