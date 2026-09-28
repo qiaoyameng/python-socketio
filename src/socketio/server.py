@@ -572,8 +572,24 @@ class Server(base_server.BaseServer):
                     namespace=namespace))
             self.manager.disconnect(sid, namespace, ignore_queue=True)
         elif not self.always_connect:
+            connect_data = {'sid': sid}
+            recovery = None
+            if getattr(self.manager, 'recovery_enabled', False):
+                recovery = self.manager.recover_session(sid, namespace, data)
+                connect_data['recovery'] = {
+                    'token': recovery['token'],
+                    'offset': recovery['offset'],
+                    'recovered': recovery['recovered'],
+                }
+                if recovery['reason'] is not None:
+                    connect_data['recovery']['reason'] = recovery['reason']
             self._send_packet(eio_sid, self.packet_class(
-                packet.CONNECT, {'sid': sid}, namespace=namespace))
+                packet.CONNECT, connect_data, namespace=namespace))
+            if recovery is not None:
+                # replay the events the client missed, in their original
+                # order, right after the CONNECT packet
+                for eio_pkt in recovery['missed']:
+                    self._send_eio_packet(eio_sid, eio_pkt)
 
     def _handle_disconnect(self, eio_sid, namespace, reason=None):
         """Handle a client disconnect."""

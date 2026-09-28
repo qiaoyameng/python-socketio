@@ -5,6 +5,10 @@ Managers
    :members:
    :inherited-members:
 
+.. autoclass:: socketio.RecoveryManager
+   :members:
+   :inherited-members:
+
 .. autoclass:: socketio.PubSubManager
    :members:
    :inherited-members:
@@ -29,6 +33,10 @@ Managers
    :members:
    :inherited-members:
 
+.. autoclass:: socketio.AsyncRecoveryManager
+   :members:
+   :inherited-members:
+
 .. autoclass:: socketio.AsyncRedisManager
    :members:
    :inherited-members:
@@ -36,4 +44,3 @@ Managers
 .. autoclass:: socketio.AsyncAioPikaManager
    :members:
    :inherited-members:
-

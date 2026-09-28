@@ -1,6 +1,7 @@
 from .client import Client
 from .simple_client import SimpleClient
 from .manager import Manager
+from .recovery_manager import RecoveryManager, AsyncRecoveryManager
 from .pubsub_manager import PubSubManager
 from .kombu_manager import KombuManager
 from .redis_manager import RedisManager
@@ -25,4 +26,4 @@ __all__ = ['SimpleClient', 'Client', 'Server', 'Manager', 'PubSubManager',
            'AsyncSimpleClient', 'AsyncClient', 'AsyncServer',
            'AsyncNamespace', 'AsyncClientNamespace', 'AsyncManager',
            'AsyncRedisManager', 'ASGIApp', 'get_tornado_handler',
-           'AsyncAioPikaManager']
+           'AsyncAioPikaManager', 'RecoveryManager', 'AsyncRecoveryManager']
